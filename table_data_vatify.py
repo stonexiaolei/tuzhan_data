@@ -110,6 +110,9 @@ def load_config(config_path="mongodb_report.conf"):
                                       config['wechat'].get('mentioned_mobile_list', '').split(',') if item.strip()],
         }
 
+    # 处理特殊校验连锁ID
+    special_validation_chain_id = mongodb_config.get('special_validation_chain_id', '').strip()
+
     return {
         'serverHost': mongodb_config['serverHost'],
         'serverPort': server_port,
@@ -119,6 +122,7 @@ def load_config(config_path="mongodb_report.conf"):
         'databaseName': mongodb_config['databaseName'],
         'collections': [col.strip() for col in mongodb_config['collections'].split(',') if col.strip()],
         'chainIds': [cid.strip() for cid in mongodb_config['chainIds'].split(',') if cid.strip()],
+        'special_validation_chain_id': special_validation_chain_id,  # 新增特殊校验连锁ID
         'chain_mappings': chain_mappings,
         'collection_mappings': collection_mappings,  # 新增集合名称映射
         'wechat': wechat_config
@@ -138,7 +142,8 @@ def create_default_config(config_path):
         'authDb': 'admin',
         'databaseName': 'your_database',
         'collections': 'collection1,collection2',
-        'chainIds': '1001,1002'
+        'chainIds': '1001,1002',
+        'special_validation_chain_id': '1001'  # 需要特殊校验当天数据的连锁ID
     }
 
     # 企业微信机器人配置
@@ -177,6 +182,264 @@ def send_wechat_notification(webhook, data):
         return False
 
 
+def validate_special_chain_today_data(client, config):
+    """
+    校验特殊连锁的当天数据
+    检查指定连锁的create_time字段是否等于当前日期
+
+    Args:
+        client: MongoDB客户端
+        config: 配置信息
+
+    Returns:
+        dict: 校验结果
+    """
+    try:
+        special_chain_id = config.get('special_validation_chain_id', '').strip()
+
+        if not special_chain_id:
+            logger.info("未配置特殊校验连锁ID，跳过特殊校验")
+            return {
+                'enabled': False,
+                'message': '未配置特殊校验连锁ID'
+            }
+
+        logger.info(f"开始特殊校验连锁 {special_chain_id} 的当天数据")
+
+        # 获取当前日期（CST时区）
+        cst_tz = pytz.timezone('Asia/Shanghai')
+        now_cst = datetime.now(cst_tz)
+        today_start = now_cst.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = now_cst.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        # 转换为UTC时间用于查询
+        today_start_utc = today_start.astimezone(pytz.utc)
+        today_end_utc = today_end.astimezone(pytz.utc)
+
+        database_name = config['databaseName']
+        collection_list = config['collections']
+        chain_mappings = config.get('chain_mappings', {})
+
+        db = client[database_name]
+
+        # 将chain_id转换为整数
+        try:
+            chain_id_long = int(special_chain_id)
+        except ValueError:
+            return {
+                'enabled': True,
+                'success': False,
+                'chain_id': special_chain_id,
+                'error': f"无效的链ID格式: {special_chain_id}",
+                'validation_time': now_cst.strftime('%Y-%m-%d %H:%M:%S')
+            }
+
+        chain_name = chain_mappings.get(special_chain_id, f"连锁ID:{special_chain_id}")
+        validation_results = []
+
+        # 对每个集合进行校验
+        for collection_name in collection_list:
+            logger.info(f"  校验集合: {collection_name}")
+
+            try:
+                collection = db[collection_name]
+
+                # 查询当天的数据
+                today_query = {
+                    "chain_id": chain_id_long,
+                    "create_time": {
+                        "$gte": today_start_utc,
+                        "$lte": today_end_utc
+                    }
+                }
+
+                # 查询该连锁的总数据
+                total_query = {"chain_id": chain_id_long}
+
+                # 执行查询
+                today_count = collection.count_documents(today_query)
+                total_count = collection.count_documents(total_query)
+
+                # 获取最新的create_time
+                latest_doc = collection.find_one(
+                    {"chain_id": chain_id_long},
+                    projection=["create_time"],
+                    sort=[("create_time", DESCENDING)]
+                )
+
+                latest_create_time_str = "无数据"
+                is_today = False
+
+                if latest_doc and 'create_time' in latest_doc:
+                    latest_create_time = latest_doc['create_time']
+
+                    # 处理时区转换
+                    if isinstance(latest_create_time, datetime):
+                        if latest_create_time.tzinfo is None:
+                            # 假设为UTC时间
+                            latest_create_time = pytz.utc.localize(latest_create_time)
+
+                        latest_cst = latest_create_time.astimezone(cst_tz)
+                        latest_create_time_str = latest_cst.strftime('%Y-%m-%d %H:%M:%S')
+
+                        # 检查是否为当天
+                        latest_date = latest_cst.date()
+                        today_date = now_cst.date()
+                        is_today = (latest_date == today_date)
+
+                # 判断验证结果：必须有当天数据且最新数据是当天的
+                validation_success = (today_count > 0 and is_today)
+
+                collection_result = {
+                    'collection': collection_name,
+                    'success': validation_success,
+                    'today_count': today_count,
+                    'total_count': total_count,
+                    'latest_create_time': latest_create_time_str,
+                    'is_latest_today': is_today
+                }
+
+                validation_results.append(collection_result)
+
+                # 记录验证结果
+                if validation_success:
+                    logger.info(f"  ✅ 特殊校验通过: {collection_name} 有 {today_count} 条当天数据")
+                else:
+                    if today_count == 0:
+                        logger.warning(f"  ⚠️ 特殊校验失败: {collection_name} 没有当天数据")
+                    elif not is_today:
+                        logger.warning(f"  ⚠️ 特殊校验失败: {collection_name} 最新数据不是当天 (最新: {latest_create_time_str})")
+
+            except Exception as e:
+                logger.error(f"  ❌ 校验集合 {collection_name} 时出错: {str(e)}")
+                validation_results.append({
+                    'collection': collection_name,
+                    'success': False,
+                    'error': str(e),
+                    'today_count': 0,
+                    'total_count': 0
+                })
+
+        # 统计总体结果
+        total_collections = len(validation_results)
+        successful_collections = sum(1 for r in validation_results if r['success'])
+        failed_collections = total_collections - successful_collections
+
+        overall_success = (failed_collections == 0)
+
+        result = {
+            'enabled': True,
+            'success': overall_success,
+            'chain_id': special_chain_id,
+            'chain_name': chain_name,
+            'total_collections': total_collections,
+            'successful_collections': successful_collections,
+            'failed_collections': failed_collections,
+            'validation_results': validation_results,
+            'validation_time': now_cst.strftime('%Y-%m-%d %H:%M:%S'),
+            'today_date': now_cst.strftime('%Y-%m-%d')
+        }
+
+        if overall_success:
+            logger.info(f"✅ 特殊连锁 {chain_name} 所有集合的当天数据校验通过")
+        else:
+            logger.warning(f"⚠️ 特殊连锁 {chain_name} 有 {failed_collections} 个集合的当天数据校验失败")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ 特殊连锁当天数据校验时出错: {str(e)}")
+        return {
+            'enabled': True,
+            'success': False,
+            'error': str(e),
+            'validation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+
+def format_special_validation_message(special_result, config):
+    """
+    格式化特殊校验结果为企业微信消息
+
+    Args:
+        special_result: 特殊校验结果
+        config: 配置信息
+
+    Returns:
+        dict: 企业微信消息格式
+    """
+    try:
+        if not special_result.get('enabled', False):
+            return None
+
+        chain_name = special_result.get('chain_name', '未知连锁')
+        success = special_result.get('success', False)
+        today_date = special_result.get('today_date', datetime.now().strftime('%Y-%m-%d'))
+        validation_time = special_result.get('validation_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+        validation_results = special_result.get('validation_results', [])
+
+        # 计算总记录数
+        total_records = sum(result.get('today_count', 0) for result in validation_results if result.get('success', False))
+
+        # 构建消息内容 - 使用新的样式
+        markdown_content = f"""# 📊 {chain_name} 数据统计报告
+**统计日期**: {today_date}
+**总记录数**: {total_records}
+"""
+
+        # 根据校验结果添加状态信息
+        if success:
+            markdown_content += """
+## ✅ 数据状态
+所有数据均为最新，无异常"""
+        else:
+            # 如果有失败的校验，显示异常信息
+            failed_results = [r for r in validation_results if not r.get('success', False)]
+            if failed_results:
+                markdown_content += "\n## ⚠️ 异常数据\n"
+                markdown_content += "以下数据需要关注:\n\n"
+
+                collection_mappings = config.get('collection_mappings', {})
+
+                for result in failed_results:
+                    collection = result.get('collection', '未知')
+                    display_collection = collection_mappings.get(collection, collection)
+                    today_count = result.get('today_count', 0)
+                    latest_time = result.get('latest_create_time', '无数据')
+
+                    # 判断问题类型
+                    if 'error' in result:
+                        problem = result['error']
+                    elif today_count == 0:
+                        problem = "无当天数据"
+                    elif not result.get('is_latest_today', False):
+                        problem = "最新数据非当天"
+                    else:
+                        problem = "数据异常"
+
+                    markdown_content += f"- **{display_collection}**: {problem}\n"
+            else:
+                markdown_content += "\n## ✅ 数据状态\n所有数据均为最新，无异常"
+
+        # 添加系统级错误信息（如果有）
+        if 'error' in special_result:
+            markdown_content += f"\n## ❌ 系统错误\n{special_result['error']}"
+
+        return {
+            "msgtype": "markdown",
+            "markdown": {
+                "content": markdown_content
+            },
+            "mentioned_list": config['wechat'].get('mentioned_list', []),
+            "mentioned_mobile_list": config['wechat'].get('mentioned_mobile_list', [])
+        }
+
+    except Exception as e:
+        logger.error(f"❌ 格式化特殊校验消息时出错: {str(e)}")
+        return None
+
+
 def format_chain_markdown_message(chain_id, chain_name, chain_data, anomalies, config, execution_time):
     """为单个连锁格式化企业微信Markdown消息"""
     # 获取集合名称映射
@@ -195,43 +458,6 @@ def format_chain_markdown_message(chain_id, chain_name, chain_data, anomalies, c
 **总记录数**: {total_records}  
 """
 
-    # 添加详细统计结果部分
-    # 如果你需要这部分内容，可以取消注释
-    # if chain_data:
-    #     markdown_content += f"\n## 📋 详细统计结果\n"
-    #     markdown_content += "| 表名称 | 统计数量 | 最后更新时间 |\n"
-    #     markdown_content += "|--------|----------|--------------|\n"
-    #
-    #     for item in chain_data:
-    #         if not isinstance(item[3], int):  # 跳过错误行
-    #             continue
-    #
-    #         timestamp, collection_name, _, record_count, max_time = item
-    #
-    #         # 使用集合映射获取中文表名，如果没有映射则使用原始名称
-    #         display_table = collection_mappings.get(collection_name, collection_name)
-    #
-    #         # 格式化时间显示
-    #         if isinstance(max_time, datetime):
-    #             formatted_time = max_time.strftime('%Y-%m-%d %H:%M:%S')
-    #         else:
-    #             formatted_time = str(max_time)[:19]  # 截断以防过长
-    #
-    #         # 高亮异常更新时间
-    #         if isinstance(max_time, datetime):
-    #             max_time_str = max_time.strftime('%Y-%m-%d')
-    #             if max_time_str != yesterday_date:
-    #                 time_display = f"<font color=\"warning\">{formatted_time}</font>"
-    #             else:
-    #                 time_display = formatted_time
-    #         else:
-    #             time_display = formatted_time
-    #
-    #         # 高亮显示记录数较多的数据
-    #         if record_count > 1000:
-    #             markdown_content += f"| {display_table} | <font color=\"warning\">{record_count}</font> | {time_display} |\n"
-    #         else:
-    #             markdown_content += f"| {display_table} | {record_count} | {time_display} |\n"
 
     # 添加异常数据部分 - 使用中文表名映射
     if anomalies:
@@ -523,6 +749,24 @@ MongoDB 日报摘要
             with open(f"{directory}/report_summary_{today}.txt", 'w', encoding='utf-8') as f:
                 f.write(summary)
 
+            # 17.5. 执行特殊连锁的当天数据校验
+            logger.info("\n" + "="*50)
+            logger.info("开始执行特殊连锁的当天数据校验")
+            logger.info("="*50)
+
+            special_validation_result = validate_special_chain_today_data(client, config)
+
+            # 保存特殊校验结果到文件
+            if special_validation_result.get('enabled', False):
+                special_validation_file = f"{directory}/special_validation_{today}.json"
+                try:
+                    import json
+                    with open(special_validation_file, 'w', encoding='utf-8') as f:
+                        json.dump(special_validation_result, f, ensure_ascii=False, indent=2, default=str)
+                    logger.info(f"✓ 特殊校验结果已保存到: {special_validation_file}")
+                except Exception as e:
+                    logger.error(f"保存特殊校验结果失败: {str(e)}")
+
             # 18. 发送企业微信通知（每个连锁单独发送）
             if wechat_enabled:
                 wechat_webhook = wechat_config.get('webhook', '')
@@ -586,6 +830,14 @@ MongoDB 日报摘要
 
                             # 避免发送过快导致限流
                             time.sleep(1)
+
+                        # 发送特殊连锁校验报告
+                        if special_validation_result.get('enabled', False):
+                            logger.info("发送特殊连锁当天数据校验报告...")
+                            special_message = format_special_validation_message(special_validation_result, config)
+                            if special_message:
+                                send_wechat_notification(wechat_webhook, special_message)
+                                time.sleep(1)  # 避免发送过快
 
                     except Exception as e:
                         logger.error(f"发送企业微信通知失败: {str(e)}")
